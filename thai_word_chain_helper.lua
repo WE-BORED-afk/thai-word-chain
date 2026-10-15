@@ -1,23 +1,31 @@
 --[[
     ╔══════════════════════════════════════════════════════════════════════╗
-    ║       THAI WORD CHAIN HELPER & AUTO-ANSWER SCRIPT (V5.6)             ║
+    ║       THAI WORD CHAIN HELPER & AUTO-ANSWER SCRIPT (V6.0)             ║
     ║           เกม: ต่อคำศัพท์ภาษาไทย [Thai Word Chain]                    ║
     ║                                                                      ║
-    ║   Changelog v5.6:                                                    ║
-    ║   1. Fixed Repeated Rejected Words Bug (แก้บั๊กตอบคำผิดซ้ำๆ):       ║
-    ║      - Removed all automatic table.clear(RejectedWords) calls.       ║
-    ║      - Implemented PermanentBlacklist: Words rejected by the server   ║
-    ║        are PERMANENTLY deleted from WordDatabase and never reused.   ║
-    ║      - Triple-layer guard: WordDatabase[w] = nil + PermanentBlacklist║
-    ║        + RejectedWords[w] = true ensures 0% chance of repeating.     ║
-    ║   2. Server Rejection Notification Listener:                         ║
-    ║      - Automatically blacklists word if server notifies "ไม่มีในพจนานุกรม"║
-    ║        or "คำนี้ถูกใช้ไปแล้ว".                                      ║
-    ║   3. Added Reset Blacklist Button in Settings (ล้างแคชคำผิดได้ตลอดเวลา):║
-    ║   4. Retained all v5.5 features:                                     ║
-    ║      - Multi-tier Turn Detection (no SeatPart blocker).              ║
-    ║      - Manual Override pills [🤖 Auto] [🟢 ตาเรา] [⏳ คู่แข่ง].       ║
-    ║      - No duplicate starting characters & full UTF-8 codepoints.     ║
+    ║   Changelog v6.0 (Major Architecture Upgrade):                       ║
+    ║   1. roundToken Cancellation System:                                 ║
+    ║      - Every async typing/submission loop checks token == roundToken  ║
+    ║        and aborts instantly if the round changed mid-operation.       ║
+    ║   2. Event-Driven Turn Detection via getgc():                        ║
+    ║      - Attempts to hook into the game's internal event module         ║
+    ║        (remoteFire/remoteConnect) for instant turn/strike/correct     ║
+    ║        notifications instead of UI polling.                          ║
+    ║      - Falls back to UI polling if getgc hook unavailable.           ║
+    ║   3. Auto-Backspace on Rejection:                                    ║
+    ║      - When a word is rejected, automatically sends backspace         ║
+    ║        keystrokes to clear typed suffix before retrying next word.    ║
+    ║   4. triedThisRound Tracking:                                        ║
+    ║      - Tracks all words attempted in the current round. Never         ║
+    ║        re-tries the same word within a single round even if it        ║
+    ║        hasn't been permanently blacklisted yet.                       ║
+    ║   5. Max Retries Per Turn (configurable, default 8):                 ║
+    ║      - Stops trying after N rejections per turn to avoid spam.       ║
+    ║   6. Player Attribute Checks:                                        ║
+    ║      - Checks LocalPlayer:GetAttribute("IsTurn") / "InGame"          ║
+    ║        for more reliable turn detection where available.              ║
+    ║   7. Retained all v5.6 features:                                     ║
+    ║      - PermanentBlacklist, UI/i18n, delay controls, manual override. ║
     ╚══════════════════════════════════════════════════════════════════════╝
 ]]
 
@@ -42,6 +50,7 @@ local Config = {
     SimulateTyping = true,         -- Simulate human typing keystrokes
     DelayBeforeTyping = 0.6,       -- Delay before starting to type (seconds)
     DelayPerChar = 0.08,           -- Delay between each character typed (seconds)
+    MaxRetriesPerTurn = 8,         -- Max words to try per turn before giving up
 }
 
 local ManualTurnOverride = "Auto"   -- "Auto", "OurTurn", "OpponentTurn"
@@ -60,6 +69,16 @@ local TurnStatusText = "TurnWaitingSeat"
 local isTypingOrSubmitting = false
 local lastSubmittedWord = ""
 
+-- ==================== V6.0: ROUND TOKEN & EVENT-DRIVEN STATE ====================
+local roundToken = 0               -- Incremented on every new round; async loops abort if stale
+local retriesThisTurn = 0          -- How many words we've tried this turn
+local triedThisRound = {}          -- Words tried in current round (reset each round)
+local pendingSuffix = 0            -- Number of suffix chars typed (for backspace on rejection)
+local pendingWord = nil            -- Currently pending word awaiting accept/reject
+local gameEventModule = nil        -- Internal game event module found via getgc()
+local eventConnections = {}        -- Stored connections for cleanup
+local useEventDriven = false       -- Whether we successfully hooked game events
+
 -- Blacklist UI words to avoid picking up random buttons
 local IgnoredUIWords = {
     ["เริ่ม"] = true, ["ออก"] = true, ["ร้านค้า"] = true, ["เวลา"] = true,
@@ -75,7 +94,7 @@ local IgnoredUIWords = {
 -- ==================== TRANSLATIONS (TH & ENG) ====================
 local I18N = {
     TH = {
-        Title = "🇹🇭 ต่อคำศัพท์ภาษาไทย | ตัวช่วยอัจฉริยะ v5.6",
+        Title = "🇹🇭 ต่อคำศัพท์ภาษาไทย | ตัวช่วยอัจฉริยะ v6.0",
         TabMain = "⚡ หน้าหลัก",
         TabLogs = "📜 บันทึก (Logs)",
         TabSettings = "⚙️ ตั้งค่า",
@@ -100,6 +119,7 @@ local I18N = {
         
         DelayBeforeTitle = "ดีเลย์ก่อนเริ่มพิมพ์ (วินาที):",
         DelayPerCharTitle = "ดีเลย์ระหว่างพิมพ์แต่ละตัว (วินาที):",
+        MaxRetriesTitle = "จำนวนครั้งลองสูงสุดต่อเทิร์น:",
         
         PromptSection = "🎯 โจทย์ปัจจุบัน (ตัวอักษรที่ต้องต่อ):",
         PromptPlaceholder = "ตรวจจับอัตโนมัติ หรือพิมพ์โจทย์เอง เช่น 'ก', 'กร', 'กรั'...",
@@ -120,9 +140,10 @@ local I18N = {
         LangTitle = "ภาษาหน้าต่าง (Language)",
         UnloadBtn = "ปิดสคริปต์ (Close UI)",
         DictStatus = "📖 ฐานข้อมูลคำศัพท์: %d คำ",
+        EventDrivenStatus = "🔗 Event Hook: %s",
     },
     ENG = {
-        Title = "🇹🇭 Thai Word Chain | Helper & Solver v5.6",
+        Title = "🇹🇭 Thai Word Chain | Helper & Solver v6.0",
         TabMain = "⚡ Main",
         TabLogs = "📜 Logs",
         TabSettings = "⚙️ Settings",
@@ -147,6 +168,7 @@ local I18N = {
         
         DelayBeforeTitle = "Delay Before Typing (Seconds):",
         DelayPerCharTitle = "Delay Per Character (Seconds):",
+        MaxRetriesTitle = "Max Retries Per Turn:",
         
         PromptSection = "🎯 Current Prompt / Prefix:",
         PromptPlaceholder = "Auto-detected or enter prefix e.g. 'ก', 'กร', 'กรั'...",
@@ -167,6 +189,7 @@ local I18N = {
         LangTitle = "Language (ภาษา)",
         UnloadBtn = "Unload / Close Script",
         DictStatus = "📖 Word Database: %d words",
+        EventDrivenStatus = "🔗 Event Hook: %s",
     }
 }
 
@@ -214,6 +237,15 @@ local function startsWithLeadingVowel(str)
         end
     end
     return false
+end
+
+-- Split a UTF-8 string into individual codepoint characters
+local function utf8Chars(str)
+    local chars = {}
+    for ch in string.gmatch(str, "[%z\1-\127\194-\244][\128-\191]*") do
+        table.insert(chars, ch)
+    end
+    return chars
 end
 
 -- ==================== EXPANDED WORD DATABASE ====================
@@ -349,6 +381,7 @@ local function blacklistRejectedWord(word)
     if not word or word == "" then return end
     RejectedWords[word] = true
     PermanentBlacklist[word] = true
+    triedThisRound[word] = true
     if WordDatabase[word] then
         WordDatabase[word] = nil
         WordCount = math.max(0, WordCount - 1)
@@ -375,8 +408,8 @@ local function findMatchingWords(prefix)
     local prefixHasLeadingVowel = startsWithLeadingVowel(prefix)
     
     for word, _ in pairs(WordDatabase) do
-        -- Strict 3-Way Filter: Never return used or rejected/blacklisted words!
-        if not UsedWords[word] and not RejectedWords[word] and not PermanentBlacklist[word] then
+        -- Strict 4-Way Filter: Never return used, rejected, blacklisted, or tried-this-round words!
+        if not UsedWords[word] and not RejectedWords[word] and not PermanentBlacklist[word] and not triedThisRound[word] then
             if prefixHasLeadingVowel or not startsWithLeadingVowel(word) then
                 if string.sub(word, 1, pLen) == prefix then
                     local charCount = getThaiCharCount(word)
@@ -398,9 +431,39 @@ local function findMatchingWords(prefix)
     return results
 end
 
+-- ==================== V6.0: EVENT MODULE DISCOVERY VIA getgc() ====================
+
+local function discoverGameEventModule()
+    if not getgc then
+        return nil
+    end
+    
+    local success, result = pcall(function()
+        local gc = getgc(true)
+        for _, v in gc do
+            if type(v) == "table" then
+                -- Look for the game's internal event module (remoteFire, remoteConnect, fire)
+                if rawget(v, "remoteFire") and rawget(v, "remoteConnect") then
+                    return v
+                end
+                -- Alternative pattern: just fire + connect
+                if rawget(v, "fire") and rawget(v, "connect") and rawget(v, "remoteFire") then
+                    return v
+                end
+            end
+        end
+        return nil
+    end)
+    
+    if success and result then
+        return result
+    end
+    return nil
+end
+
 -- ==================== GUI CREATION ====================
 local ScreenGui = Instance.new("ScreenGui")
-ScreenGui.Name = "ThaiWordChainHelper_v5_6"
+ScreenGui.Name = "ThaiWordChainHelper_v6_0"
 ScreenGui.ResetOnSpawn = false
 ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 
@@ -831,21 +894,21 @@ local piCrn = Instance.new("UICorner")
 piCrn.CornerRadius = UDim.new(0, 6)
 piCrn.Parent = PromptInput
 
-local ClearBtn = Instance.new("TextButton")
-ClearBtn.Size = UDim2.new(0, 56, 0, 30)
-ClearBtn.Position = UDim2.new(1, -64, 0.5, -15)
-ClearBtn.BackgroundColor3 = Color3.fromRGB(70, 75, 90)
-ClearBtn.Font = Enum.Font.GothamBold
-ClearBtn.Text = getText("ClearBtn")
-ClearBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-ClearBtn.TextSize = 11
-ClearBtn.Parent = PromptCard
+local ClearBtn2 = Instance.new("TextButton")
+ClearBtn2.Size = UDim2.new(0, 56, 0, 30)
+ClearBtn2.Position = UDim2.new(1, -64, 0.5, -15)
+ClearBtn2.BackgroundColor3 = Color3.fromRGB(70, 75, 90)
+ClearBtn2.Font = Enum.Font.GothamBold
+ClearBtn2.Text = getText("ClearBtn")
+ClearBtn2.TextColor3 = Color3.fromRGB(255, 255, 255)
+ClearBtn2.TextSize = 11
+ClearBtn2.Parent = PromptCard
 local clrCrn = Instance.new("UICorner")
 clrCrn.CornerRadius = UDim.new(0, 6)
-clrCrn.Parent = ClearBtn
-table.insert(ElementsToTranslate, {Title = ClearBtn, TitleKey = "ClearBtn"})
+clrCrn.Parent = ClearBtn2
+table.insert(ElementsToTranslate, {Title = ClearBtn2, TitleKey = "ClearBtn"})
 
-ClearBtn.MouseButton1Click:Connect(function()
+ClearBtn2.MouseButton1Click:Connect(function()
     PromptInput.Text = ""
 end)
 
@@ -1091,7 +1154,7 @@ DebugScanBtn.MouseButton1Click:Connect(function()
 end)
 
 -- Initial Log Entry
-addLogEntry("Script initialized v5.6. Ready to play Thai Word Chain.", Color3.fromRGB(46, 204, 113))
+addLogEntry("Script initialized v6.0. Ready to play Thai Word Chain.", Color3.fromRGB(46, 204, 113))
 
 -- ==================== TAB 3: SETTINGS PAGE ====================
 local SettingsScroll = Instance.new("ScrollingFrame")
@@ -1206,6 +1269,43 @@ DpcInput.FocusLost:Connect(function()
     end
 end)
 
+-- Max Retries Per Turn
+local MaxRetriesCard = createCard(SettingsScroll, 54)
+local MrLabel = Instance.new("TextLabel")
+MrLabel.Size = UDim2.new(1, -110, 1, 0)
+MrLabel.Position = UDim2.new(0, 14, 0, 0)
+MrLabel.BackgroundTransparency = 1
+MrLabel.Font = Enum.Font.GothamBold
+MrLabel.Text = getText("MaxRetriesTitle")
+MrLabel.TextColor3 = Color3.fromRGB(240, 240, 245)
+MrLabel.TextSize = 12
+MrLabel.TextXAlignment = Enum.TextXAlignment.Left
+MrLabel.Parent = MaxRetriesCard
+table.insert(ElementsToTranslate, {Title = MrLabel, TitleKey = "MaxRetriesTitle"})
+
+local MrInput = Instance.new("TextBox")
+MrInput.Size = UDim2.new(0, 80, 0, 32)
+MrInput.Position = UDim2.new(1, -94, 0.5, -16)
+MrInput.BackgroundColor3 = Color3.fromRGB(20, 22, 28)
+MrInput.Font = Enum.Font.GothamBold
+MrInput.Text = tostring(Config.MaxRetriesPerTurn)
+MrInput.TextColor3 = Color3.fromRGB(46, 204, 113)
+MrInput.TextSize = 13
+MrInput.Parent = MaxRetriesCard
+local mrCrn = Instance.new("UICorner")
+mrCrn.CornerRadius = UDim.new(0, 6)
+mrCrn.Parent = MrInput
+
+MrInput.FocusLost:Connect(function()
+    local val = tonumber(MrInput.Text)
+    if val and val >= 1 then
+        Config.MaxRetriesPerTurn = math.floor(val)
+        addLogEntry("Updated MaxRetriesPerTurn to " .. Config.MaxRetriesPerTurn, Color3.fromRGB(200, 200, 200))
+    else
+        MrInput.Text = tostring(Config.MaxRetriesPerTurn)
+    end
+end)
+
 -- Reset Blacklist Button Card
 local ResetBlacklistCard = createCard(SettingsScroll, 48)
 local ResetBlacklistBtn = Instance.new("TextButton")
@@ -1226,6 +1326,7 @@ ResetBlacklistBtn.MouseButton1Click:Connect(function()
     table.clear(PermanentBlacklist)
     table.clear(RejectedWords)
     table.clear(UsedWords)
+    table.clear(triedThisRound)
     populateInitialWords()
     ResetBlacklistBtn.Text = "ล้าง Blacklist เรียบร้อย!"
     addLogEntry(string.format("Cleared Blacklist & Used Words (%d words reset).", count), Color3.fromRGB(155, 89, 182))
@@ -1245,6 +1346,19 @@ DbInfoLabel.TextColor3 = Color3.fromRGB(46, 204, 113)
 DbInfoLabel.TextSize = 12
 DbInfoLabel.TextXAlignment = Enum.TextXAlignment.Left
 DbInfoLabel.Parent = DbInfoCard
+
+-- Event Hook Status Card
+local EventInfoCard = createCard(SettingsScroll, 50)
+local EventInfoLabel = Instance.new("TextLabel")
+EventInfoLabel.Size = UDim2.new(1, -20, 1, 0)
+EventInfoLabel.Position = UDim2.new(0, 14, 0, 0)
+EventInfoLabel.BackgroundTransparency = 1
+EventInfoLabel.Font = Enum.Font.GothamBold
+EventInfoLabel.Text = getText("EventDrivenStatus", "กำลังค้นหา...")
+EventInfoLabel.TextColor3 = Color3.fromRGB(52, 152, 219)
+EventInfoLabel.TextSize = 12
+EventInfoLabel.TextXAlignment = Enum.TextXAlignment.Left
+EventInfoLabel.Parent = EventInfoCard
 
 -- Unload Button
 local UnloadCard = createCard(SettingsScroll, 48)
@@ -1286,6 +1400,7 @@ local function updateLanguage(newLang)
     TurnBadge.Text = getText(TurnStatusText)
     PromptInput.PlaceholderText = getText("PromptPlaceholder")
     DbInfoLabel.Text = getText("DictStatus", WordCount)
+    EventInfoLabel.Text = getText("EventDrivenStatus", useEventDriven and "เชื่อมต่อแล้ว ✅" or "ไม่พบ (ใช้ UI Polling)")
     ResetBlacklistBtn.Text = getText("ResetBlacklistBtn", getTableCount(PermanentBlacklist))
     refreshWordList(PromptInput.Text)
 end
@@ -1295,7 +1410,7 @@ LangToggleBtn.MouseButton1Click:Connect(function()
     updateLanguage(nextLang)
 end)
 
--- ==================== SMART DETECTION FUNCTIONS (V5.6) ====================
+-- ==================== SMART DETECTION FUNCTIONS (V6.0) ====================
 
 local function isGuiVisible(gui)
     if not gui or not gui:IsA("GuiObject") then return false end
@@ -1375,6 +1490,17 @@ local function getGameTurnState()
         return "OurTurn", box
     elseif ManualTurnOverride == "OpponentTurn" then
         return "OpponentTurn", nil
+    end
+    
+    -- V6.0: Check Player Attribute first (most reliable if game sets it)
+    local isTurnAttr = pcall(function() return LocalPlayer:GetAttribute("IsTurn") end)
+    if isTurnAttr == true then
+        local attrVal = LocalPlayer:GetAttribute("IsTurn")
+        if attrVal == true then
+            return "OurTurn", findGameTextBox()
+        elseif attrVal == false then
+            return "OpponentTurn", nil
+        end
     end
     
     local pGui = LocalPlayer:FindFirstChild("PlayerGui")
@@ -1480,13 +1606,19 @@ local function extractCurrentPrompt(activeBox)
 end
 
 runDebugScan = function()
-    addLogEntry("========== [UI & TURN DIAGNOSTIC SCAN] ==========", Color3.fromRGB(241, 196, 15))
+    addLogEntry("========== [UI & TURN DIAGNOSTIC SCAN v6.0] ==========", Color3.fromRGB(241, 196, 15))
     local char = LocalPlayer.Character
     local hum = char and char:FindFirstChild("Humanoid")
     
     addLogEntry(string.format("Player: %s (@%s)", LocalPlayer.DisplayName, LocalPlayer.Name), Color3.fromRGB(200, 200, 200))
     addLogEntry(string.format("Humanoid Sit: %s | SeatPart: %s", tostring(hum and hum.Sit), tostring(hum and hum.SeatPart)), Color3.fromRGB(200, 200, 200))
     addLogEntry(string.format("Permanent Blacklist Size: %d words", getTableCount(PermanentBlacklist)), Color3.fromRGB(155, 89, 182))
+    addLogEntry(string.format("Event-Driven Mode: %s | roundToken: %d | retries: %d", tostring(useEventDriven), roundToken, retriesThisTurn), Color3.fromRGB(52, 152, 219))
+    
+    -- Check Player Attributes
+    local isTurnAttr = pcall(function() return LocalPlayer:GetAttribute("IsTurn") end)
+    local inGameAttr = pcall(function() return LocalPlayer:GetAttribute("InGame") end)
+    addLogEntry(string.format("Player IsTurn attr: %s | InGame attr: %s", tostring(LocalPlayer:GetAttribute("IsTurn")), tostring(LocalPlayer:GetAttribute("InGame"))), Color3.fromRGB(200, 200, 200))
     
     local pGui = LocalPlayer:FindFirstChild("PlayerGui")
     local allDumpLines = {}
@@ -1529,7 +1661,41 @@ runDebugScan = function()
     end
 end
 
--- Connect Server Remotes Listeners
+-- ==================== V6.0: BACKSPACE HELPER (clear typed suffix) ====================
+
+local function sendBackspaces(count, token)
+    if count <= 0 then return end
+    
+    -- Method 1: Use game event module's tryKeystroke if available
+    if gameEventModule and rawget(gameEventModule, "fire") then
+        for i = 1, count do
+            if token ~= roundToken then return end -- Abort if round changed
+            pcall(function()
+                gameEventModule.fire("tryKeystroke", -1)
+            end)
+            task.wait(0.04)
+        end
+        return
+    end
+    
+    -- Method 2: Use TypingRemote to send progressively shorter text
+    if TypingRemote then
+        -- Just clear the textbox entirely and resend the prefix
+        pcall(function()
+            TypingRemote:FireServer(CurrentPrompt)
+        end)
+    end
+    
+    -- Method 3: Clear TextBox directly
+    local box = findGameTextBox()
+    if box and box.Parent then
+        pcall(function()
+            box.Text = CurrentPrompt
+        end)
+    end
+end
+
+-- ==================== Connect Server Remotes Listeners ====================
 if Remotes then
     local matchEv = Remotes:FindFirstChild("Match")
     if matchEv and matchEv:IsA("RemoteEvent") then
@@ -1560,7 +1726,47 @@ if Remotes then
                     if lastSubmittedWord and lastSubmittedWord ~= "" then
                         blacklistRejectedWord(lastSubmittedWord)
                         addLogEntry(string.format("⛔ Blacklisted '%s' via Server Notify.", lastSubmittedWord), Color3.fromRGB(231, 76, 60))
-                        refreshWordList(CurrentPrompt)
+                        
+                        -- V6.0: Auto-backspace and retry
+                        if Config.AutoAnswer and not isTypingOrSubmitting then
+                            local token = roundToken
+                            retriesThisTurn = retriesThisTurn + 1
+                            
+                            if retriesThisTurn <= Config.MaxRetriesPerTurn then
+                                task.spawn(function()
+                                    sendBackspaces(pendingSuffix, token)
+                                    task.wait(0.15)
+                                    if token ~= roundToken then return end
+                                    
+                                    -- Find and submit next word
+                                    local matches = findMatchingWords(CurrentPrompt)
+                                    refreshWordList(CurrentPrompt)
+                                    if #matches > 0 then
+                                        local candidate = matches[1].Word
+                                        addLogEntry(string.format("🔄 Retry #%d: Trying '%s'...", retriesThisTurn, candidate), Color3.fromRGB(230, 126, 34))
+                                        typeAndSubmitWord(candidate, CurrentPrompt, nil, token)
+                                    else
+                                        addLogEntry(string.format("⚠️ No words left for '%s' after %d retries", CurrentPrompt, retriesThisTurn), Color3.fromRGB(230, 126, 34))
+                                    end
+                                end)
+                            else
+                                addLogEntry(string.format("🚫 Max retries (%d) reached for this turn.", Config.MaxRetriesPerTurn), Color3.fromRGB(231, 76, 60))
+                            end
+                        end
+                    end
+                end
+                
+                -- Detect word accepted (ถูกต้อง / correct)
+                if string.find(msgStr, "ถูกต้อง") or string.find(msgStr, "correct") or string.find(msgStr, "สำเร็จ") then
+                    if lastSubmittedWord and lastSubmittedWord ~= "" then
+                        markWordUsed(lastSubmittedWord)
+                        addLogEntry(string.format("✅ Word '%s' accepted via Server Notify!", lastSubmittedWord), Color3.fromRGB(46, 204, 113))
+                        -- Advance round
+                        roundToken = roundToken + 1
+                        pendingWord = nil
+                        pendingSuffix = 0
+                        retriesThisTurn = 0
+                        triedThisRound = {}
                     end
                 end
             end
@@ -1568,28 +1774,54 @@ if Remotes then
     end
 end
 
--- ==================== REALISTIC KEYSTROKE TYPING & SUBMISSION ====================
+-- ==================== V6.0: REALISTIC KEYSTROKE TYPING & SUBMISSION (with roundToken) ====================
 
-typeAndSubmitWord = function(word, prefix, targetTextBox)
+typeAndSubmitWord = function(word, prefix, targetTextBox, token)
     if not word or word == "" then return false end
     if not SubmitRemote then
         addLogEntry("Error: SubmitRemote not found!", Color3.fromRGB(231, 76, 60))
         return false
     end
     
+    -- Use current roundToken if not passed
+    token = token or roundToken
+    
+    -- Abort if round already changed
+    if token ~= roundToken then
+        addLogEntry("⏹️ Aborted: round changed before typing.", Color3.fromRGB(180, 185, 200))
+        return false
+    end
+    
     isTypingOrSubmitting = true
     lastSubmittedWord = word
+    pendingWord = word
+    triedThisRound[word] = true
     local wordLen = getThaiCharCount(word)
     addLogEntry(string.format("Typing word '%s' (%d chars)...", word, wordLen), Color3.fromRGB(52, 152, 219))
     
     -- 1. Delay before typing starts
     if Config.DelayBeforeTyping > 0 then
-        task.wait(Config.DelayBeforeTyping)
+        local waited = 0
+        while waited < Config.DelayBeforeTyping do
+            if token ~= roundToken then
+                isTypingOrSubmitting = false
+                addLogEntry("⏹️ Round changed during pre-type delay.", Color3.fromRGB(180, 185, 200))
+                return false
+            end
+            task.wait(0.05)
+            waited = waited + 0.05
+        end
     end
     
-    -- Check if turn is still ours
+    -- Check if turn is still ours (and token still valid)
+    if token ~= roundToken then
+        isTypingOrSubmitting = false
+        addLogEntry("⏹️ Round changed, aborting.", Color3.fromRGB(180, 185, 200))
+        return false
+    end
+    
     local currentTurnState, currentBox = getGameTurnState()
-    if currentTurnState ~= "OurTurn" then
+    if currentTurnState ~= "OurTurn" and ManualTurnOverride ~= "OurTurn" then
         isTypingOrSubmitting = false
         addLogEntry("Turn expired before typing began.", Color3.fromRGB(231, 76, 60))
         return false
@@ -1605,21 +1837,28 @@ typeAndSubmitWord = function(word, prefix, targetTextBox)
         prefix = ""
     end
     
+    -- Track suffix length for backspace on rejection
+    pendingSuffix = getThaiCharCount(suffix)
+    
     if targetTextBox and targetTextBox.Parent then
         pcall(function() targetTextBox.Text = prefix end)
     end
     
-    -- 3. Simulate typing suffix only
+    -- 3. Simulate typing suffix only, checking roundToken at each character
     local currentText = prefix
-    local suffixChars = {}
-    for ch in string.gmatch(suffix, "[%z\1-\127\194-\244][\128-\191]*") do
-        table.insert(suffixChars, ch)
-    end
+    local suffixChars = utf8Chars(suffix)
     
     if Config.SimulateTyping then
-        for _, ch in ipairs(suffixChars) do
+        for idx, ch in ipairs(suffixChars) do
+            -- V6.0: Check roundToken before every keystroke
+            if token ~= roundToken then
+                isTypingOrSubmitting = false
+                addLogEntry("⏹️ Round changed mid-typing, aborted.", Color3.fromRGB(180, 185, 200))
+                return false
+            end
+            
             local stateNow = getGameTurnState()
-            if stateNow ~= "OurTurn" then
+            if stateNow ~= "OurTurn" and ManualTurnOverride ~= "OurTurn" then
                 isTypingOrSubmitting = false
                 return false
             end
@@ -1629,10 +1868,23 @@ typeAndSubmitWord = function(word, prefix, targetTextBox)
             if targetTextBox and targetTextBox.Parent then
                 pcall(function() targetTextBox.Text = currentText end)
             end
-            if TypingRemote then
+            
+            -- Use game event module keystroke if available, otherwise TypingRemote
+            if gameEventModule and rawget(gameEventModule, "fire") then
+                pcall(function()
+                    gameEventModule.fire("tryKeystroke", ch)
+                end)
+            elseif TypingRemote then
                 pcall(function() TypingRemote:FireServer(currentText) end)
             end
+            
             task.wait(Config.DelayPerChar or 0.08)
+        end
+        
+        -- Final token check before submit
+        if token ~= roundToken then
+            isTypingOrSubmitting = false
+            return false
         end
         
         task.wait(0.12)
@@ -1640,6 +1892,12 @@ typeAndSubmitWord = function(word, prefix, targetTextBox)
             pcall(function() TypingRemote:FireServer(word .. "\r") end)
         end
     else
+        -- Instant mode
+        if token ~= roundToken then
+            isTypingOrSubmitting = false
+            return false
+        end
+        
         if targetTextBox and targetTextBox.Parent then
             pcall(function() targetTextBox.Text = word end)
         end
@@ -1650,7 +1908,18 @@ typeAndSubmitWord = function(word, prefix, targetTextBox)
         end
     end
     
-    -- 4. Submit word to Server
+    -- 4. Final roundToken check before submit
+    if token ~= roundToken then
+        isTypingOrSubmitting = false
+        return false
+    end
+    
+    -- 5. Submit word to Server (or via game event module)
+    if gameEventModule and rawget(gameEventModule, "fire") then
+        pcall(function()
+            gameEventModule.fire("tryAnswer")
+        end)
+    end
     pcall(function()
         SubmitRemote:FireServer(word)
     end)
@@ -1664,7 +1933,173 @@ typeAndSubmitWord = function(word, prefix, targetTextBox)
     return true
 end
 
--- ==================== AUTO-ANSWER & MAIN GAME LOOP ====================
+-- ==================== V6.0: EVENT-DRIVEN HOOKS (getgc) ====================
+
+task.spawn(function()
+    -- Try to discover game event module
+    gameEventModule = discoverGameEventModule()
+    
+    if gameEventModule then
+        useEventDriven = true
+        addLogEntry("🔗 Event Module found via getgc()! Using event-driven mode.", Color3.fromRGB(46, 204, 113))
+        EventInfoLabel.Text = getText("EventDrivenStatus", "เชื่อมต่อแล้ว ✅")
+        EventInfoLabel.TextColor3 = Color3.fromRGB(46, 204, 113)
+        
+        -- Hook: updateRound (new round started, receive prompt + turn player)
+        pcall(function()
+            local conn = gameEventModule.remoteConnect("updateRound", function(prompt, _, turnPlr)
+                roundToken = roundToken + 1
+                triedThisRound = {}
+                retriesThisTurn = 0
+                pendingWord = nil
+                pendingSuffix = 0
+                
+                -- Detect if it's our turn
+                if turnPlr == LocalPlayer then
+                    ServerTurnState = "OurTurn"
+                    
+                    -- Extract prompt text
+                    local promptText = nil
+                    if type(prompt) == "table" then
+                        promptText = prompt.RequiredLetter or prompt.Prompt or prompt.Letter
+                    elseif type(prompt) == "string" then
+                        promptText = prompt
+                    end
+                    
+                    if promptText then
+                        CurrentPrompt = tostring(promptText)
+                        PromptInput.Text = CurrentPrompt
+                        addLogEntry(string.format("🎯 [Event] Our Turn! Prompt: '%s' (Mode: %s)", CurrentPrompt, Config.DetectedMode), Color3.fromRGB(255, 215, 0))
+                        refreshWordList(CurrentPrompt)
+                        
+                        -- Auto-answer
+                        if Config.AutoAnswer then
+                            local token = roundToken
+                            task.spawn(function()
+                                local matches = findMatchingWords(CurrentPrompt)
+                                if #matches > 0 then
+                                    typeAndSubmitWord(matches[1].Word, CurrentPrompt, nil, token)
+                                else
+                                    addLogEntry(string.format("⚠️ No words for prompt '%s'", CurrentPrompt), Color3.fromRGB(230, 126, 34))
+                                end
+                            end)
+                        end
+                    end
+                else
+                    ServerTurnState = "OpponentTurn"
+                    if turnPlr then
+                        addLogEntry(string.format("📡 [Event] Opponent's turn: %s", tostring(turnPlr)), Color3.fromRGB(180, 185, 200))
+                    end
+                end
+            end)
+            table.insert(eventConnections, conn)
+        end)
+        
+        -- Hook: strike (word rejected)
+        pcall(function()
+            local conn = gameEventModule.remoteConnect("strike", function(uid, _, alreadyUsed)
+                if uid ~= LocalPlayer.UserId then return end
+                if not pendingWord then return end
+                
+                local w = pendingWord
+                
+                if alreadyUsed then
+                    -- Word was already used by someone
+                    UsedWords[w] = true
+                    addLogEntry(string.format("⛔ [Event] '%s' already used!", w), Color3.fromRGB(231, 76, 60))
+                else
+                    -- Word not in dictionary
+                    blacklistRejectedWord(w)
+                    addLogEntry(string.format("⛔ [Event] '%s' rejected & blacklisted!", w), Color3.fromRGB(231, 76, 60))
+                end
+                
+                pendingWord = nil
+                retriesThisTurn = retriesThisTurn + 1
+                
+                if retriesThisTurn > Config.MaxRetriesPerTurn then
+                    addLogEntry(string.format("🚫 Max retries (%d) reached.", Config.MaxRetriesPerTurn), Color3.fromRGB(231, 76, 60))
+                    return
+                end
+                
+                if not Config.AutoAnswer then return end
+                
+                -- Backspace and retry
+                local token = roundToken
+                local backspaces = pendingSuffix or 0
+                
+                task.spawn(function()
+                    sendBackspaces(backspaces, token)
+                    if token ~= roundToken then return end
+                    
+                    task.wait(0.1)
+                    local matches = findMatchingWords(CurrentPrompt)
+                    refreshWordList(CurrentPrompt)
+                    
+                    if #matches > 0 then
+                        addLogEntry(string.format("🔄 [Event] Retry #%d: '%s'", retriesThisTurn, matches[1].Word), Color3.fromRGB(230, 126, 34))
+                        typeAndSubmitWord(matches[1].Word, CurrentPrompt, nil, token)
+                    else
+                        addLogEntry(string.format("⚠️ No words left for '%s'", CurrentPrompt), Color3.fromRGB(230, 126, 34))
+                    end
+                end)
+            end)
+            table.insert(eventConnections, conn)
+        end)
+        
+        -- Hook: correct (word accepted)
+        pcall(function()
+            local conn = gameEventModule.remoteConnect("correct", function(word)
+                if pendingWord then
+                    markWordUsed(pendingWord)
+                    addLogEntry(string.format("✅ [Event] '%s' accepted!", pendingWord), Color3.fromRGB(46, 204, 113))
+                end
+                if type(word) == "string" and word ~= "" then
+                    markWordUsed(word)
+                end
+                
+                roundToken = roundToken + 1
+                pendingWord = nil
+                pendingSuffix = 0
+                retriesThisTurn = 0
+                triedThisRound = {}
+            end)
+            table.insert(eventConnections, conn)
+        end)
+        
+        -- Hook: takeDamage (time ran out or penalty)
+        pcall(function()
+            local conn = gameEventModule.remoteConnect("takeDamage", function(uid)
+                if uid == LocalPlayer.UserId then
+                    roundToken = roundToken + 1
+                    pendingWord = nil
+                    pendingSuffix = 0
+                    addLogEntry("💥 [Event] Time out / Damage taken.", Color3.fromRGB(231, 76, 60))
+                end
+            end)
+            table.insert(eventConnections, conn)
+        end)
+        
+    else
+        useEventDriven = false
+        addLogEntry("⚠️ getgc() event module not found. Using UI polling fallback.", Color3.fromRGB(230, 126, 34))
+        EventInfoLabel.Text = getText("EventDrivenStatus", "ไม่พบ (UI Polling)")
+        EventInfoLabel.TextColor3 = Color3.fromRGB(230, 126, 34)
+    end
+    
+    -- Also check for InGame attribute changes
+    pcall(function()
+        LocalPlayer:GetAttributeChangedSignal("InGame"):Connect(function()
+            if LocalPlayer:GetAttribute("InGame") then
+                table.clear(UsedWords)
+                table.clear(triedThisRound)
+                retriesThisTurn = 0
+                addLogEntry("🎮 InGame attribute changed: New game started.", Color3.fromRGB(52, 152, 219))
+            end
+        end)
+    end)
+end)
+
+-- ==================== AUTO-ANSWER & MAIN GAME LOOP (FALLBACK FOR NON-EVENT MODE) ====================
 
 local lastKnownMode = "None"
 
@@ -1688,7 +2123,7 @@ task.spawn(function()
             end
         end
         
-        -- 2. Turn State Detection
+        -- 2. Turn State Detection & UI Update
         local turnState, activeBox = getGameTurnState()
         
         if turnState == "NotSeated" then
@@ -1706,66 +2141,93 @@ task.spawn(function()
             TurnBadge.Text = getText("TurnOurs")
             TurnBadge.TextColor3 = Color3.fromRGB(46, 204, 113)
             
-            local prompt = extractCurrentPrompt(activeBox)
-            if prompt and prompt ~= "" then
-                if prompt ~= CurrentPrompt then
-                    CurrentPrompt = prompt
-                    PromptInput.Text = prompt
-                    addLogEntry(string.format("🎯 Our Turn! Prompt: '%s' (Mode: %s)", prompt, Config.DetectedMode), Color3.fromRGB(255, 215, 0))
-                    refreshWordList(prompt)
-                end
-                
-                -- Auto-Answer Execution
-                if Config.AutoAnswer and not isTypingOrSubmitting then
-                    local matches = findMatchingWords(CurrentPrompt)
-                    if #matches > 0 then
-                        local candidate = matches[1].Word
-                        local submitted = typeAndSubmitWord(candidate, CurrentPrompt, activeBox)
-                        if submitted then
-                            -- Wait up to 1.2s to check if word passes or fails
-                            local roundPassed = false
-                            local checkStart = tick()
-                            
-                            while (tick() - checkStart) < 1.2 do
-                                task.wait(0.1)
-                                local stateNow, boxNow = getGameTurnState()
-                                local promptNow = extractCurrentPrompt(boxNow)
-                                if stateNow == "OpponentTurn" or (promptNow and promptNow ~= CurrentPrompt) then
-                                    roundPassed = true
-                                    break
-                                end
-                            end
-                            
-                            if roundPassed then
-                                markWordUsed(candidate)
-                                addLogEntry(string.format("✅ Word '%s' accepted! Turn passed. Waiting for opponent...", candidate), Color3.fromRGB(46, 204, 113))
-                                
-                                -- Safe transition wait (max 2.5s timeout, NEVER freezes thread)
-                                local waitLimit = tick() + 2.5
-                                while tick() < waitLimit do
-                                    local s, _ = getGameTurnState()
-                                    if s ~= "OurTurn" then break end
-                                    task.wait(0.2)
+            -- Only do polling-based auto-answer if NOT using event-driven mode
+            if not useEventDriven then
+                local prompt = extractCurrentPrompt(activeBox)
+                if prompt and prompt ~= "" then
+                    if prompt ~= CurrentPrompt then
+                        -- New prompt detected! Advance round token
+                        roundToken = roundToken + 1
+                        triedThisRound = {}
+                        retriesThisTurn = 0
+                        CurrentPrompt = prompt
+                        PromptInput.Text = prompt
+                        addLogEntry(string.format("🎯 New Prompt: '%s' (Mode: %s)", prompt, Config.DetectedMode), Color3.fromRGB(255, 215, 0))
+                        refreshWordList(prompt)
+                    end
+                    
+                    -- Auto-Answer Execution (polling fallback)
+                    if Config.AutoAnswer and not isTypingOrSubmitting then
+                        if retriesThisTurn >= Config.MaxRetriesPerTurn then
+                            -- Already hit max retries, don't try more
+                        else
+                            local matches = findMatchingWords(CurrentPrompt)
+                            if #matches > 0 then
+                                local candidate = matches[1].Word
+                                local token = roundToken
+                                local submitted = typeAndSubmitWord(candidate, CurrentPrompt, activeBox, token)
+                                if submitted then
+                                    -- Wait up to 1.2s to check if word passes or fails
+                                    local roundPassed = false
+                                    local checkStart = tick()
+                                    
+                                    while (tick() - checkStart) < 1.2 do
+                                        task.wait(0.1)
+                                        if token ~= roundToken then
+                                            roundPassed = true
+                                            break
+                                        end
+                                        local stateNow, boxNow = getGameTurnState()
+                                        local promptNow = extractCurrentPrompt(boxNow)
+                                        if stateNow == "OpponentTurn" or (promptNow and promptNow ~= CurrentPrompt) then
+                                            roundPassed = true
+                                            break
+                                        end
+                                    end
+                                    
+                                    if roundPassed then
+                                        markWordUsed(candidate)
+                                        addLogEntry(string.format("✅ Word '%s' accepted!", candidate), Color3.fromRGB(46, 204, 113))
+                                        roundToken = roundToken + 1
+                                        triedThisRound = {}
+                                        retriesThisTurn = 0
+                                        
+                                        -- Safe transition wait
+                                        local waitLimit = tick() + 2.5
+                                        while tick() < waitLimit do
+                                            local s, _ = getGameTurnState()
+                                            if s ~= "OurTurn" then break end
+                                            task.wait(0.2)
+                                        end
+                                    else
+                                        -- Word rejected via polling
+                                        blacklistRejectedWord(candidate)
+                                        retriesThisTurn = retriesThisTurn + 1
+                                        TurnStatusText = "TurnRetrying"
+                                        TurnBadge.Text = getText("TurnRetrying")
+                                        TurnBadge.TextColor3 = Color3.fromRGB(231, 76, 60)
+                                        addLogEntry(string.format("❌ Word '%s' rejected! (Retry %d/%d)", candidate, retriesThisTurn, Config.MaxRetriesPerTurn), Color3.fromRGB(231, 76, 60))
+                                        
+                                        -- V6.0: Auto-backspace before retry
+                                        sendBackspaces(pendingSuffix, token)
+                                        
+                                        refreshWordList(CurrentPrompt)
+                                        task.wait(0.2)
+                                    end
                                 end
                             else
-                                -- Word rejected: PERMANENTLY blacklist and purge from memory!
-                                blacklistRejectedWord(candidate)
-                                TurnStatusText = "TurnRetrying"
-                                TurnBadge.Text = getText("TurnRetrying")
-                                TurnBadge.TextColor3 = Color3.fromRGB(231, 76, 60)
-                                addLogEntry(string.format("❌ Word '%s' rejected! Blacklisted permanently. Retrying next word...", candidate), Color3.fromRGB(231, 76, 60))
-                                refreshWordList(CurrentPrompt)
-                                task.wait(0.2)
+                                addLogEntry(string.format("⚠️ No available words left for prompt '%s'", CurrentPrompt), Color3.fromRGB(230, 126, 34))
+                                task.wait(1.0)
                             end
                         end
-                    else
-                        addLogEntry(string.format("⚠️ No available words left for prompt '%s'", CurrentPrompt), Color3.fromRGB(230, 126, 34))
-                        task.wait(1.0)
                     end
                 end
             end
         end
+        
+        -- Update settings info labels periodically
+        DbInfoLabel.Text = getText("DictStatus", WordCount)
     end
 end)
 
-print("[ThaiWordChain] Helper v5.6 (Permanent Blacklist & Zero Repetition) Loaded!")
+print("[ThaiWordChain] Helper v6.0 (Event-Driven + roundToken + Auto-Backspace) Loaded!")
