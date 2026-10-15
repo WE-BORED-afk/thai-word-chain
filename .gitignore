@@ -1,6 +1,7 @@
 # Logs and dumps
 *.log
 *.txt
+!game_dictionary.txt
 word_chain_log_*.txt
 word_chain_ui_dump.txt
 

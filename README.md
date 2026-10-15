@@ -6,7 +6,7 @@
 
 ## ⚡ วิธีรันสคริปต์ (Quick Loader)
 
-นำโค้ดด้านล่างนี้ไปวางใน Roblox Executor (เช่น Delta, Fluxus, Wave, Codex, Hydrogen, Krnl, ฯลฯ) แล้วกด Execute:
+นำโค้ดด้านล่างนี้ไปวางใน Roblox Executor (เช่น Real, Delta, Fluxus, Wave, Codex, Hydrogen, Krnl, ฯลฯ) แล้วกด Execute:
 
 ```lua
 loadstring(game:HttpGet("https://raw.githubusercontent.com/WE-BORED-afk/thai-word-chain/main/thai_word_chain_helper.lua"))()
@@ -14,14 +14,16 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/WE-BORED-afk/thai-wor
 
 ---
 
-## 🌟 ฟีเจอร์เด่นในเวอร์ชัน 6.1
+## 🌟 ฟีเจอร์เด่นในเวอร์ชัน 7.0
 
 | ฟังก์ชัน | รายละเอียด |
 |---|---|
-| **🎯 แก้บั๊กนับสระ/วรรณยุกต์ในโหมดยาก** | ใช้ระบบ `getThaiBaseCharCount` คัดกรองเฉพาะพยัญชนะและสระระดับบรรทัด ไม่นับสระบน/ล่าง (ั, ิ, ี, ึ, ื, ุ, ู, ฺ, ็) และวรรณยุกต์/การันต์ (่, ้, ๊, ๋, ์) เพื่อการันตีว่าคำที่เลือกมีอย่างน้อย 5 ตัวอักษรแท้จริง (แก้ปัญหาคำเช่น บอกซ์, ปกปิด, ปกรณ์ โดนปฏิเสธ) |
+| **📖 คลังคำศัพท์แท้จากเกม (60,933 คำ)** | สกัดคลังคำศัพท์ทางการจาก Memory ของเกมโดยตรง (`game_dictionary.txt`) แทนที่คำศัพท์ทั่วไปของ PyThaiNLP หมดปัญหาคำศัพท์เซิร์ฟเวอร์ไม่รับ 100% |
+| **🛡️ กรองตัวอักษรเดี่ยว/หัวหมวด (Anti-Single Char)** | กรองตัวอักษรเดี่ยว (ก, ข, ค, ... ฮ) และสระที่เป็นหัวแท็บออกอย่างหมดจด บังคับว่าคำตอบต้องยาวกว่าโจทย์ (`#word > #prefix` และ `>= 2 ตัวอักษร`) ป้องกันการเลือกตัวอักษรโดดๆ |
+| **⚡ ระบบโหลดแบบ Multi-Tier (4 ลำดับ)** | **Tier 1:** อ่านไฟล์ `game_dictionary.txt` ใน Workspace ในเครื่อง (รวดเร็ว 0.05 วิ) ➔ **Tier 2:** ดึงจาก GitHub Raw ➔ **Tier 3:** สแกน Memory ผ่าน `getgc(true)` ➔ **Tier 4:** FallbackWords |
+| **🎯 นับพยัญชนะ/สระบรรทัดแท้ในโหมดยาก** | ใช้ `getThaiBaseCharCount` ไม่นับสระบน/ล่าง (ั, ิ, ี, ึ, ื, ุ, ู, ฺ, ็) และวรรณยุกต์/การันต์ การันตี 5 ตัวอักษรแท้จริง |
 | **🔒 Sticky / Latched Hard Mode** | โหมดโต๊ะจะไม่เด้งสลับกลับไปเป็น Easy เมื่อหน้าต่างเลือกโต๊ะปิดตัวลง ล็อกโหมดยากต่อเนื่องตลอดการนั่งเล่นที่โต๊ะ |
-| **🔘 3-Way Mode Pill Selector** | เพิ่มปุ่มลัดเลือกโหมดแบบเดียวกับสถานะเทิร์น `[🤖 Auto] [🟢 ง่าย] [🔴 ยาก]` สลับและล็อกโหมดยากได้ด้วยคลิกเดียว |
-| **🛡️ Impassable Hard Mode Safety Guard** | ระบบบล็อกการพิมพ์คำที่มีตัวอักษรไม่ถึง 5 ตัวในโหมดยากทันที ป้องกันความผิดพลาด 100% |
+| **🔘 3-Way Mode Pill Selector** | ปุ่มลัดเลือกโหมดแบบเดียวกับสถานะเทิร์น `[🤖 Auto] [🟢 ง่าย] [🔴 ยาก]` สลับและล็อกโหมดได้ทันที |
 | **⚡ Event-Driven Detection** | ดักจับ Event ภายในเกมผ่าน `getgc()` (`updateRound`, `strike`, `correct`) ตอบสนองฉับไวไม่ต้องรอ UI Polling |
 | **🛡️ Token Desync Protection** | ใช้ระบบ `roundToken` ตรวจสอบสถานะก่อนพิมพ์ทุกตัวอักษร ตัดการทำงานทันทีหากหมดเทิร์น ป้องกันการพิมพ์ข้ามรอบ |
 | **⌫ Auto-Backspace on Rejection** | เมื่อเซิร์ฟเวอร์แจ้งว่าคำไม่ผ่าน สคริปต์จะลบตัวอักษรที่พิมพ์ค้างไว้อัตโนมัติ แล้วสุ่มลองคำใหม่ทันที |
@@ -34,7 +36,12 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/WE-BORED-afk/thai-wor
 
 หากต้องการรันเวอร์ชันเฉพาะเจาะจง สามารถเปลี่ยน URL ดึงตาม Tag ได้เลย:
 
-### โหลด v6.1 (ล่าสุด):
+### โหลด v7.0 (ล่าสุด):
+```lua
+loadstring(game:HttpGet("https://raw.githubusercontent.com/WE-BORED-afk/thai-word-chain/v7.0/thai_word_chain_helper.lua"))()
+```
+
+### โหลด v6.1:
 ```lua
 loadstring(game:HttpGet("https://raw.githubusercontent.com/WE-BORED-afk/thai-word-chain/v6.1/thai_word_chain_helper.lua"))()
 ```
@@ -54,6 +61,7 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/WE-BORED-afk/thai-wor
 ## 🛠️ การจัดการโค้ดผ่าน Git
 
 - ดูประวัติเวอร์ชัน: `git log --oneline --decorate`
+- สลับไปดู v7.0: `git checkout v7.0`
+- สลับไปดู v6.1: `git checkout v6.1`
 - สลับไปดู v6.0: `git checkout v6.0`
-- สลับไปดู v5.6: `git checkout v5.6`
-- กลับมา v6.1 (main): `git checkout main`
+- กลับมา v7.0 (main): `git checkout main`
