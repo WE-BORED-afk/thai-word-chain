@@ -1,31 +1,29 @@
 --[[
     ╔══════════════════════════════════════════════════════════════════════╗
-    ║       THAI WORD CHAIN HELPER & AUTO-ANSWER SCRIPT (V6.0)             ║
+    ║       THAI WORD CHAIN HELPER & AUTO-ANSWER SCRIPT (V6.1)             ║
     ║           เกม: ต่อคำศัพท์ภาษาไทย [Thai Word Chain]                    ║
     ║                                                                      ║
-    ║   Changelog v6.0 (Major Architecture Upgrade):                       ║
-    ║   1. roundToken Cancellation System:                                 ║
-    ║      - Every async typing/submission loop checks token == roundToken  ║
-    ║        and aborts instantly if the round changed mid-operation.       ║
-    ║   2. Event-Driven Turn Detection via getgc():                        ║
-    ║      - Attempts to hook into the game's internal event module         ║
-    ║        (remoteFire/remoteConnect) for instant turn/strike/correct     ║
-    ║        notifications instead of UI polling.                          ║
-    ║      - Falls back to UI polling if getgc hook unavailable.           ║
-    ║   3. Auto-Backspace on Rejection:                                    ║
-    ║      - When a word is rejected, automatically sends backspace         ║
-    ║        keystrokes to clear typed suffix before retrying next word.    ║
-    ║   4. triedThisRound Tracking:                                        ║
-    ║      - Tracks all words attempted in the current round. Never         ║
-    ║        re-tries the same word within a single round even if it        ║
-    ║        hasn't been permanently blacklisted yet.                       ║
-    ║   5. Max Retries Per Turn (configurable, default 8):                 ║
-    ║      - Stops trying after N rejections per turn to avoid spam.       ║
-    ║   6. Player Attribute Checks:                                        ║
-    ║      - Checks LocalPlayer:GetAttribute("IsTurn") / "InGame"          ║
-    ║        for more reliable turn detection where available.              ║
-    ║   7. Retained all v5.6 features:                                     ║
-    ║      - PermanentBlacklist, UI/i18n, delay controls, manual override. ║
+    ║   Changelog v6.1 (Fix Hard Mode < 5 Chars Bug):                      ║
+    ║   1. Fixed Hard Mode Linguistic Character Counting:                  ║
+    ║      - Upper/Lower vowels (สระบน/ล่าง: ั, ิ, ี, ึ, ื, ุ, ู, ฺ, ็)    ║
+    ║        and tone/cancellation marks (วรรณยุกต์/การันต์: ่, ้, ๊, ๋, ์)  ║
+    ║        are combining marks and DO NOT count as standalone characters.║
+    ║      - Implemented getThaiBaseCharCount() to ensure only base letters║
+    ║        (พยัญชนะ + สระระดับบรรทัด) are counted towards the 5-char     ║
+    ║        minimum in Hard Mode (preventing words like บอกซ์, ปกปิด).     ║
+    ║   2. Sticky / Latched Hard Mode Detection:                           ║
+    ║      - Hard mode no longer flickers or randomly resets to Easy mode  ║
+    ║        when the table popup disappears.                              ║
+    ║      - Latches to Hard Mode as long as player remains seated.        ║
+    ║   3. 3-Way Mode Pill Selector GUI:                                   ║
+    ║      - Added [🤖 Auto] [🟢 ง่าย] [🔴 ยาก] pill buttons in UI for     ║
+    ║        instant one-click manual locking with clear visual badges.    ║
+    ║   4. Hard Mode Safety Net in typeAndSubmitWord:                      ║
+    ║      - Refuses to type or submit any word with < 5 base letters      ║
+    ║        whenever Hard Mode is active.                                 ║
+    ║   5. Retained all v6.0 & v5.6 features:                              ║
+    ║      - roundToken async cancellation, getgc event-driven hooks,      ║
+    ║        PermanentBlacklist, triedThisRound, auto-backspace on strike. ║
     ╚══════════════════════════════════════════════════════════════════════╝
 ]]
 
@@ -55,6 +53,7 @@ local Config = {
 
 local ManualTurnOverride = "Auto"   -- "Auto", "OurTurn", "OpponentTurn"
 local ManualModeOverride = "Auto"   -- "Auto", "Easy", "Hard"
+local LatchedTableMode = nil        -- Sticky table mode while seated ("Hard" or "Easy")
 local ServerTurnState = nil         -- Updated by Remotes.Match listener
 
 local WordDatabase = {}
@@ -94,15 +93,19 @@ local IgnoredUIWords = {
 -- ==================== TRANSLATIONS (TH & ENG) ====================
 local I18N = {
     TH = {
-        Title = "🇹🇭 ต่อคำศัพท์ภาษาไทย | ตัวช่วยอัจฉริยะ v6.0",
+        Title = "🇹🇭 ต่อคำศัพท์ภาษาไทย | ตัวช่วยอัจฉริยะ v6.1",
         TabMain = "⚡ หน้าหลัก",
         TabLogs = "📜 บันทึก (Logs)",
         TabSettings = "⚙️ ตั้งค่า",
         
         ModeLabel = "🎮 โหมดที่โต๊ะ:",
-        ModeEasy = "🟢 ง่าย (กี่ตัวก็ได้)",
-        ModeHard = "🔴 ยาก (5+ ตัว)",
-        ModeAuto = "🤖 ออโต้",
+        ModeAutoBtn = "🤖 Auto",
+        ModeEasyBtn = "🟢 ง่าย",
+        ModeHardBtn = "🔴 ยาก",
+        ModeEasy = "🟢 โหมดง่าย (กี่ตัวก็ได้)",
+        ModeHard = "🔴 โหมดยาก (ขั้นต่ำ 5 ตัว)",
+        ModeEasyLocked = "🔒 โหมดง่าย (ล็อก)",
+        ModeHardLocked = "🔒 โหมดยาก (ล็อก 5+ ตัว)",
         
         TurnStatusLabel = "👤 สถานะเทิร์น:",
         TurnWaitingSeat = "🪑 รอเริ่มเกม / นั่งที่โต๊ะ",
@@ -143,15 +146,19 @@ local I18N = {
         EventDrivenStatus = "🔗 Event Hook: %s",
     },
     ENG = {
-        Title = "🇹🇭 Thai Word Chain | Helper & Solver v6.0",
+        Title = "🇹🇭 Thai Word Chain | Helper & Solver v6.1",
         TabMain = "⚡ Main",
         TabLogs = "📜 Logs",
         TabSettings = "⚙️ Settings",
         
         ModeLabel = "🎮 Table Mode:",
+        ModeAutoBtn = "🤖 Auto",
+        ModeEasyBtn = "🟢 Easy",
+        ModeHardBtn = "🔴 Hard",
         ModeEasy = "🟢 Easy (Any length)",
         ModeHard = "🔴 Hard (Min 5 chars)",
-        ModeAuto = "🤖 Auto",
+        ModeEasyLocked = "🔒 Easy (Locked)",
+        ModeHardLocked = "🔒 Hard (Locked 5+ chars)",
         
         TurnStatusLabel = "👤 Turn Status:",
         TurnWaitingSeat = "🪑 Waiting for Game / Table",
@@ -202,8 +209,37 @@ local function getText(key, ...)
     return str
 end
 
--- ==================== ACCURATE THAI UTF-8 UTILITIES ====================
+-- ==================== ACCURATE THAI CHARACTER COUNTING UTILITIES ====================
 
+-- Determines if a Unicode codepoint is a Thai combining mark (non-spacing upper/lower vowel, tone mark, or thanthakhat)
+-- In Thai Word Chain and Thai language rules, these sit on/under a consonant and DO NOT count as a standalone character.
+local function isThaiCombiningMark(code)
+    -- 3633: MAI HAN-AKAT (ั)
+    -- 3636 to 3642: SARA I (ิ), SARA II (ี), SARA UE (ึ), SARA UEE (ื), SARA U (ุ), SARA UU (ู), PHINTHU (ฺ)
+    -- 3655 to 3662: MAITAIKHU (็), MAI EK (่), MAI THO (้), MAI TRI (๊), MAI CHATTAWA (๋), THANTHAKHAT (์), NIKHAHIT (ํ), YAMAKKAN (๎)
+    return code == 3633 or (code >= 3636 and code <= 3642) or (code >= 3655 and code <= 3662)
+end
+
+-- Counts only standalone/base characters (Consonants + in-line vowels like เ, แ, โ, ใ, ไ, ะ, า, ำ, อ)
+-- Words like 'บอกซ์', 'ปกปิด', 'ปกรณ์' have only 4 base characters, so they are properly recognized as < 5.
+local function getThaiBaseCharCount(str)
+    if not str or str == "" then return 0 end
+    local count = 0
+    pcall(function()
+        for _, code in utf8.codes(str) do
+            if code >= 3585 and code <= 3675 then
+                if not isThaiCombiningMark(code) then
+                    count = count + 1
+                end
+            elseif (code >= 65 and code <= 90) or (code >= 97 and code <= 122) or (code >= 48 and code <= 57) then
+                count = count + 1
+            end
+        end
+    end)
+    return count
+end
+
+-- Total UTF-8 codepoints count
 local function getThaiCharCount(str)
     if not str or str == "" then return 0 end
     local ok, len = pcall(utf8.len, str)
@@ -246,6 +282,13 @@ local function utf8Chars(str)
         table.insert(chars, ch)
     end
     return chars
+end
+
+-- Helper to check if Hard Mode is currently active (Manual or Detected)
+local function isHardModeActive()
+    if ManualModeOverride == "Hard" then return true end
+    if ManualModeOverride == "Easy" then return false end
+    return Config.DetectedMode == "Hard"
 end
 
 -- ==================== EXPANDED WORD DATABASE ====================
@@ -398,13 +441,14 @@ local function markWordUsed(word)
     end
 end
 
+-- Finds matching words for the given prefix, strictly adhering to mode constraints
 local function findMatchingWords(prefix)
     prefix = string.gsub(prefix or "", "^%s*(.-)%s*$", "%1")
     if prefix == "" then return {} end
     
     local results = {}
     local pLen = #prefix
-    local minLength = (Config.DetectedMode == "Hard") and 5 or 1
+    local hardMode = isHardModeActive()
     local prefixHasLeadingVowel = startsWithLeadingVowel(prefix)
     
     for word, _ in pairs(WordDatabase) do
@@ -412,9 +456,21 @@ local function findMatchingWords(prefix)
         if not UsedWords[word] and not RejectedWords[word] and not PermanentBlacklist[word] and not triedThisRound[word] then
             if prefixHasLeadingVowel or not startsWithLeadingVowel(word) then
                 if string.sub(word, 1, pLen) == prefix then
-                    local charCount = getThaiCharCount(word)
-                    if charCount >= minLength then
-                        table.insert(results, {Word = word, Length = charCount})
+                    local baseCount = getThaiBaseCharCount(word)
+                    local totalCount = getThaiCharCount(word)
+                    
+                    if hardMode then
+                        -- Hard Mode: Word MUST have AT LEAST 5 standalone base letters
+                        -- AND total UTF-8 character length >= 5.
+                        -- Words like 'บอกซ์' (4 base), 'ปกปิด' (4 base), 'ปกรณ์' (4 base) are STRICTLY excluded!
+                        if baseCount >= 5 and totalCount >= 5 then
+                            table.insert(results, {Word = word, Length = baseCount})
+                        end
+                    else
+                        -- Easy Mode: Any word length >= 1 allowed
+                        if totalCount >= 1 then
+                            table.insert(results, {Word = word, Length = totalCount})
+                        end
                     end
                 end
             end
@@ -442,11 +498,9 @@ local function discoverGameEventModule()
         local gc = getgc(true)
         for _, v in gc do
             if type(v) == "table" then
-                -- Look for the game's internal event module (remoteFire, remoteConnect, fire)
                 if rawget(v, "remoteFire") and rawget(v, "remoteConnect") then
                     return v
                 end
-                -- Alternative pattern: just fire + connect
                 if rawget(v, "fire") and rawget(v, "connect") and rawget(v, "remoteFire") then
                     return v
                 end
@@ -463,7 +517,7 @@ end
 
 -- ==================== GUI CREATION ====================
 local ScreenGui = Instance.new("ScreenGui")
-ScreenGui.Name = "ThaiWordChainHelper_v6_0"
+ScreenGui.Name = "ThaiWordChainHelper_v6_1"
 ScreenGui.ResetOnSpawn = false
 ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 
@@ -638,14 +692,18 @@ local function createCard(parent, height, yPos)
     return card
 end
 
+-- Forward declaration of refreshWordList
+local refreshWordList
+local addLogEntry
+
 -- ==================== TAB 1: MAIN PAGE ====================
 
 local StatusCard = createCard(MainPage, 74, 0)
 
--- Mode Row
+-- Mode Row & 3-Way Quick Pill Selectors
 local ModeLabel = Instance.new("TextLabel")
-ModeLabel.Size = UDim2.new(0, 110, 0, 24)
-ModeLabel.Position = UDim2.new(0, 12, 0, 6)
+ModeLabel.Size = UDim2.new(0, 70, 0, 24)
+ModeLabel.Position = UDim2.new(0, 12, 0, 7)
 ModeLabel.BackgroundTransparency = 1
 ModeLabel.Font = Enum.Font.GothamBold
 ModeLabel.Text = getText("ModeLabel")
@@ -655,35 +713,104 @@ ModeLabel.TextXAlignment = Enum.TextXAlignment.Left
 ModeLabel.Parent = StatusCard
 table.insert(ElementsToTranslate, {Title = ModeLabel, TitleKey = "ModeLabel"})
 
-local ModeBadgeBtn = Instance.new("TextButton")
-ModeBadgeBtn.Size = UDim2.new(0, 160, 0, 22)
-ModeBadgeBtn.Position = UDim2.new(0, 125, 0, 7)
-ModeBadgeBtn.BackgroundColor3 = Color3.fromRGB(40, 44, 58)
-ModeBadgeBtn.Font = Enum.Font.GothamBold
-ModeBadgeBtn.Text = getText("ModeEasy")
-ModeBadgeBtn.TextColor3 = Color3.fromRGB(46, 204, 113)
-ModeBadgeBtn.TextSize = 11
-ModeBadgeBtn.Parent = StatusCard
-local mbCrn = Instance.new("UICorner")
-mbCrn.CornerRadius = UDim.new(0, 6)
-mbCrn.Parent = ModeBadgeBtn
+local ModeAutoBtn = Instance.new("TextButton")
+ModeAutoBtn.Size = UDim2.new(0, 56, 0, 22)
+ModeAutoBtn.Position = UDim2.new(0, 85, 0, 8)
+ModeAutoBtn.BackgroundColor3 = Color3.fromRGB(52, 152, 219)
+ModeAutoBtn.Font = Enum.Font.GothamBold
+ModeAutoBtn.Text = getText("ModeAutoBtn")
+ModeAutoBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+ModeAutoBtn.TextSize = 10
+ModeAutoBtn.Parent = StatusCard
+local mabCrn = Instance.new("UICorner")
+mabCrn.CornerRadius = UDim.new(0, 6)
+mabCrn.Parent = ModeAutoBtn
 
-ModeBadgeBtn.MouseButton1Click:Connect(function()
+local ModeEasyBtn = Instance.new("TextButton")
+ModeEasyBtn.Size = UDim2.new(0, 60, 0, 22)
+ModeEasyBtn.Position = UDim2.new(0, 146, 0, 8)
+ModeEasyBtn.BackgroundColor3 = Color3.fromRGB(44, 48, 62)
+ModeEasyBtn.Font = Enum.Font.GothamBold
+ModeEasyBtn.Text = getText("ModeEasyBtn")
+ModeEasyBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+ModeEasyBtn.TextSize = 10
+ModeEasyBtn.Parent = StatusCard
+local mebCrn = Instance.new("UICorner")
+mebCrn.CornerRadius = UDim.new(0, 6)
+mebCrn.Parent = ModeEasyBtn
+
+local ModeHardBtn = Instance.new("TextButton")
+ModeHardBtn.Size = UDim2.new(0, 66, 0, 22)
+ModeHardBtn.Position = UDim2.new(0, 211, 0, 8)
+ModeHardBtn.BackgroundColor3 = Color3.fromRGB(44, 48, 62)
+ModeHardBtn.Font = Enum.Font.GothamBold
+ModeHardBtn.Text = getText("ModeHardBtn")
+ModeHardBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+ModeHardBtn.TextSize = 10
+ModeHardBtn.Parent = StatusCard
+local mhbCrn = Instance.new("UICorner")
+mhbCrn.CornerRadius = UDim.new(0, 6)
+mhbCrn.Parent = ModeHardBtn
+
+local ModeBadge = Instance.new("TextLabel")
+ModeBadge.Size = UDim2.new(1, -290, 0, 22)
+ModeBadge.Position = UDim2.new(0, 285, 0, 8)
+ModeBadge.BackgroundTransparency = 1
+ModeBadge.Font = Enum.Font.GothamBold
+ModeBadge.Text = getText("ModeEasy")
+ModeBadge.TextColor3 = Color3.fromRGB(46, 204, 113)
+ModeBadge.TextSize = 11
+ModeBadge.TextXAlignment = Enum.TextXAlignment.Left
+ModeBadge.Parent = StatusCard
+
+local function updateModePillButtons()
     if ManualModeOverride == "Auto" then
-        ManualModeOverride = "Hard"
-        Config.DetectedMode = "Hard"
-        ModeBadgeBtn.Text = getText("ModeHard") .. " (ล็อก)"
-        ModeBadgeBtn.TextColor3 = Color3.fromRGB(231, 76, 60)
+        ModeAutoBtn.BackgroundColor3 = Color3.fromRGB(52, 152, 219)
+        ModeEasyBtn.BackgroundColor3 = Color3.fromRGB(44, 48, 62)
+        ModeHardBtn.BackgroundColor3 = Color3.fromRGB(44, 48, 62)
+        if Config.DetectedMode == "Hard" then
+            ModeBadge.Text = getText("ModeHard")
+            ModeBadge.TextColor3 = Color3.fromRGB(231, 76, 60)
+        else
+            ModeBadge.Text = getText("ModeEasy")
+            ModeBadge.TextColor3 = Color3.fromRGB(46, 204, 113)
+        end
     elseif ManualModeOverride == "Hard" then
-        ManualModeOverride = "Easy"
-        Config.DetectedMode = "Easy"
-        ModeBadgeBtn.Text = getText("ModeEasy") .. " (ล็อก)"
-        ModeBadgeBtn.TextColor3 = Color3.fromRGB(46, 204, 113)
-    else
-        ManualModeOverride = "Auto"
-        ModeBadgeBtn.Text = getText("ModeAuto") .. ": " .. (Config.DetectedMode == "Hard" and "ยาก" or "ง่าย")
-        ModeBadgeBtn.TextColor3 = Color3.fromRGB(52, 152, 219)
+        ModeAutoBtn.BackgroundColor3 = Color3.fromRGB(44, 48, 62)
+        ModeEasyBtn.BackgroundColor3 = Color3.fromRGB(44, 48, 62)
+        ModeHardBtn.BackgroundColor3 = Color3.fromRGB(231, 76, 60)
+        ModeBadge.Text = getText("ModeHardLocked")
+        ModeBadge.TextColor3 = Color3.fromRGB(231, 76, 60)
+    elseif ManualModeOverride == "Easy" then
+        ModeAutoBtn.BackgroundColor3 = Color3.fromRGB(44, 48, 62)
+        ModeEasyBtn.BackgroundColor3 = Color3.fromRGB(46, 204, 113)
+        ModeHardBtn.BackgroundColor3 = Color3.fromRGB(44, 48, 62)
+        ModeBadge.Text = getText("ModeEasyLocked")
+        ModeBadge.TextColor3 = Color3.fromRGB(46, 204, 113)
     end
+end
+
+ModeAutoBtn.MouseButton1Click:Connect(function()
+    ManualModeOverride = "Auto"
+    updateModePillButtons()
+    if addLogEntry then addLogEntry("Mode set to [Auto Detection].", Color3.fromRGB(52, 152, 219)) end
+    if refreshWordList then refreshWordList(CurrentPrompt) end
+end)
+
+ModeEasyBtn.MouseButton1Click:Connect(function()
+    ManualModeOverride = "Easy"
+    Config.DetectedMode = "Easy"
+    updateModePillButtons()
+    if addLogEntry then addLogEntry("Mode manually locked to [Easy Mode].", Color3.fromRGB(46, 204, 113)) end
+    if refreshWordList then refreshWordList(CurrentPrompt) end
+end)
+
+ModeHardBtn.MouseButton1Click:Connect(function()
+    ManualModeOverride = "Hard"
+    Config.DetectedMode = "Hard"
+    updateModePillButtons()
+    if addLogEntry then addLogEntry("Mode manually locked to [Hard Mode - Min 5 Base Chars].", Color3.fromRGB(231, 76, 60)) end
+    if refreshWordList then refreshWordList(CurrentPrompt) end
 end)
 
 -- Turn Row & 3-Way Quick Pill Selectors
@@ -943,11 +1070,10 @@ WsLayout.Parent = WordScroll
 
 -- Function prototypes
 local typeAndSubmitWord
-local addLogEntry
 local runDebugScan
 
 -- Function to refresh displayed words in the scroll list
-local function refreshWordList(prefix)
+refreshWordList = function(prefix)
     for _, item in ipairs(WordScroll:GetChildren()) do
         if item:IsA("TextButton") then item:Destroy() end
     end
@@ -958,12 +1084,14 @@ local function refreshWordList(prefix)
     end
     
     local matches = findMatchingWords(prefix)
+    local hardMode = isHardModeActive()
+    
     if #matches == 0 then
         WlHeader.Text = getText("WordListTitle") .. " " .. getText("NoWordsFound")
         return
     end
     
-    WlHeader.Text = getText("WordListTitle") .. string.format(" (%d คำ | %s)", #matches, (Config.DetectedMode == "Hard") and "โหมดยาก >= 5 ตัว" or "โหมดง่าย")
+    WlHeader.Text = getText("WordListTitle") .. string.format(" (%d คำ | %s)", #matches, hardMode and "โหมดยาก >= 5 ตัว" or "โหมดง่าย")
     
     for i = 1, math.min(#matches, 60) do
         local data = matches[i]
@@ -1154,7 +1282,7 @@ DebugScanBtn.MouseButton1Click:Connect(function()
 end)
 
 -- Initial Log Entry
-addLogEntry("Script initialized v6.0. Ready to play Thai Word Chain.", Color3.fromRGB(46, 204, 113))
+addLogEntry("Script initialized v6.1. Ready to play Thai Word Chain.", Color3.fromRGB(46, 204, 113))
 
 -- ==================== TAB 3: SETTINGS PAGE ====================
 local SettingsScroll = Instance.new("ScrollingFrame")
@@ -1396,7 +1524,7 @@ local function updateLanguage(newLang)
         end
     end
     
-    ModeBadgeBtn.Text = (Config.DetectedMode == "Hard") and getText("ModeHard") or getText("ModeEasy")
+    updateModePillButtons()
     TurnBadge.Text = getText(TurnStatusText)
     PromptInput.PlaceholderText = getText("PromptPlaceholder")
     DbInfoLabel.Text = getText("DictStatus", WordCount)
@@ -1410,7 +1538,7 @@ LangToggleBtn.MouseButton1Click:Connect(function()
     updateLanguage(nextLang)
 end)
 
--- ==================== SMART DETECTION FUNCTIONS (V6.0) ====================
+-- ==================== SMART DETECTION FUNCTIONS (V6.1) ====================
 
 local function isGuiVisible(gui)
     if not gui or not gui:IsA("GuiObject") then return false end
@@ -1444,41 +1572,86 @@ local function findGameTextBox()
     return nil
 end
 
+-- V6.1 Sticky / Latched Table Mode Detection
 local function detectTableMode()
+    -- 1. Manual Overrides strictly take top priority
     if ManualModeOverride == "Hard" then return "Hard" end
     if ManualModeOverride == "Easy" then return "Easy" end
+    
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChild("Humanoid")
+    local isSitting = hum and (hum.Sit or hum.SeatPart ~= nil)
     
     local function checkTextForHard(text)
         if not text then return false end
         return string.find(text, "5") or string.find(text, "ยาก") or string.find(text, "Hard") or string.find(text, "๕")
     end
     
+    local function checkTextForEasy(text)
+        if not text then return false end
+        return string.find(text, "ง่าย") or string.find(text, "Easy")
+    end
+    
+    -- 2. Inspect SeatPart and all parent models/containers up to workspace
+    if hum and hum.SeatPart then
+        local current = hum.SeatPart
+        while current and current ~= workspace do
+            -- Check name
+            if checkTextForHard(current.Name) then
+                LatchedTableMode = "Hard"
+                return "Hard"
+            end
+            -- Check attributes
+            for k, v in pairs(current:GetAttributes()) do
+                if checkTextForHard(tostring(k)) or checkTextForHard(tostring(v)) then
+                    LatchedTableMode = "Hard"
+                    return "Hard"
+                end
+            end
+            -- Check child Value objects
+            for _, child in ipairs(current:GetChildren()) do
+                if child:IsA("StringValue") or child:IsA("IntValue") or child:IsA("BoolValue") then
+                    if checkTextForHard(child.Name) or checkTextForHard(tostring(child.Value)) then
+                        LatchedTableMode = "Hard"
+                        return "Hard"
+                    end
+                elseif child:IsA("BillboardGui") or child:IsA("SurfaceGui") then
+                    for _, label in ipairs(child:GetDescendants()) do
+                        if label:IsA("TextLabel") and checkTextForHard(label.Text) then
+                            LatchedTableMode = "Hard"
+                            return "Hard"
+                        end
+                    end
+                end
+            end
+            current = current.Parent
+        end
+    end
+    
+    -- 3. Check PlayerGui for Table Mode indicators
     local pGui = LocalPlayer:FindFirstChild("PlayerGui")
     if pGui then
         for _, desc in ipairs(pGui:GetDescendants()) do
             if desc:IsA("TextLabel") and isGuiVisible(desc) and not desc:IsDescendantOf(ScreenGui) then
                 local txt = desc.Text
-                if checkTextForHard(txt) and (string.find(txt, "โหมด") or string.find(txt, "ขั้นต่ำ") or string.find(txt, "ตัว") or string.find(txt, "mode")) then
-                    return "Hard"
+                if txt and txt ~= "" then
+                    if checkTextForHard(txt) and (string.find(txt, "โหมด") or string.find(txt, "ขั้นต่ำ") or string.find(txt, "ตัว") or string.find(txt, "mode") or string.find(txt, "โต๊ะ")) then
+                        LatchedTableMode = "Hard"
+                        return "Hard"
+                    end
                 end
             end
         end
     end
     
-    local char = LocalPlayer.Character
-    local root = char and char:FindFirstChild("HumanoidRootPart")
-    if root then
-        for _, obj in ipairs(workspace:GetDescendants()) do
-            if obj:IsA("Model") and (string.find(string.lower(obj.Name), "table") or string.find(string.lower(obj.Name), "chair")) then
-                local p = obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart")
-                if p and (p.Position - root.Position).Magnitude < 15 then
-                    if checkTextForHard(obj.Name) then return "Hard" end
-                    for k, v in pairs(obj:GetAttributes()) do
-                        if checkTextForHard(tostring(k)) or checkTextForHard(tostring(v)) then return "Hard" end
-                    end
-                end
-            end
-        end
+    -- 4. Sticky Latch: If previously detected Hard while sitting, KEEP IT HARD!
+    if isSitting and LatchedTableMode == "Hard" then
+        return "Hard"
+    end
+    
+    -- 5. If player stands up / leaves table, clear the latch
+    if not isSitting then
+        LatchedTableMode = nil
     end
     
     return "Easy"
@@ -1606,13 +1779,14 @@ local function extractCurrentPrompt(activeBox)
 end
 
 runDebugScan = function()
-    addLogEntry("========== [UI & TURN DIAGNOSTIC SCAN v6.0] ==========", Color3.fromRGB(241, 196, 15))
+    addLogEntry("========== [UI & TURN DIAGNOSTIC SCAN v6.1] ==========", Color3.fromRGB(241, 196, 15))
     local char = LocalPlayer.Character
     local hum = char and char:FindFirstChild("Humanoid")
     
     addLogEntry(string.format("Player: %s (@%s)", LocalPlayer.DisplayName, LocalPlayer.Name), Color3.fromRGB(200, 200, 200))
     addLogEntry(string.format("Humanoid Sit: %s | SeatPart: %s", tostring(hum and hum.Sit), tostring(hum and hum.SeatPart)), Color3.fromRGB(200, 200, 200))
     addLogEntry(string.format("Permanent Blacklist Size: %d words", getTableCount(PermanentBlacklist)), Color3.fromRGB(155, 89, 182))
+    addLogEntry(string.format("Mode: %s (Override: %s, Latched: %s)", Config.DetectedMode, ManualModeOverride, tostring(LatchedTableMode)), Color3.fromRGB(231, 76, 60))
     addLogEntry(string.format("Event-Driven Mode: %s | roundToken: %d | retries: %d", tostring(useEventDriven), roundToken, retriesThisTurn), Color3.fromRGB(52, 152, 219))
     
     -- Check Player Attributes
@@ -1666,10 +1840,9 @@ end
 local function sendBackspaces(count, token)
     if count <= 0 then return end
     
-    -- Method 1: Use game event module's tryKeystroke if available
     if gameEventModule and rawget(gameEventModule, "fire") then
         for i = 1, count do
-            if token ~= roundToken then return end -- Abort if round changed
+            if token ~= roundToken then return end
             pcall(function()
                 gameEventModule.fire("tryKeystroke", -1)
             end)
@@ -1678,15 +1851,12 @@ local function sendBackspaces(count, token)
         return
     end
     
-    -- Method 2: Use TypingRemote to send progressively shorter text
     if TypingRemote then
-        -- Just clear the textbox entirely and resend the prefix
         pcall(function()
             TypingRemote:FireServer(CurrentPrompt)
         end)
     end
     
-    -- Method 3: Clear TextBox directly
     local box = findGameTextBox()
     if box and box.Parent then
         pcall(function()
@@ -1710,6 +1880,18 @@ if Remotes then
                     ServerTurnState = "OpponentTurn"
                     addLogEntry(string.format("📡 Server Match: Turn for %s", a.Name), Color3.fromRGB(180, 185, 200))
                 end
+                
+                -- Check if server passes mode information
+                if type(a) == "table" then
+                    for k, v in pairs(a) do
+                        local kvStr = string.lower(tostring(k) .. "=" .. tostring(v))
+                        if string.find(kvStr, "hard") or string.find(kvStr, "ยาก") or string.find(kvStr, "5") then
+                            LatchedTableMode = "Hard"
+                            Config.DetectedMode = "Hard"
+                            updateModePillButtons()
+                        end
+                    end
+                end
             end
         end)
     end
@@ -1720,6 +1902,13 @@ if Remotes then
             if msg then
                 local msgStr = tostring(msg)
                 addLogEntry("Server: " .. msgStr, Color3.fromRGB(243, 156, 18))
+                
+                -- Detect hard mode notification from server
+                if string.find(msgStr, "ยาก") or string.find(msgStr, "5 ตัว") or string.find(msgStr, "ขั้นต่ำ 5") then
+                    LatchedTableMode = "Hard"
+                    Config.DetectedMode = "Hard"
+                    updateModePillButtons()
+                end
                 
                 -- Auto-blacklist word if server rejects it
                 if string.find(msgStr, "ไม่มี") or string.find(msgStr, "ใช้ไปแล้ว") or string.find(msgStr, "ผิด") or string.find(msgStr, "สั้น") then
@@ -1738,7 +1927,6 @@ if Remotes then
                                     task.wait(0.15)
                                     if token ~= roundToken then return end
                                     
-                                    -- Find and submit next word
                                     local matches = findMatchingWords(CurrentPrompt)
                                     refreshWordList(CurrentPrompt)
                                     if #matches > 0 then
@@ -1756,12 +1944,11 @@ if Remotes then
                     end
                 end
                 
-                -- Detect word accepted (ถูกต้อง / correct)
+                -- Detect word accepted
                 if string.find(msgStr, "ถูกต้อง") or string.find(msgStr, "correct") or string.find(msgStr, "สำเร็จ") then
                     if lastSubmittedWord and lastSubmittedWord ~= "" then
                         markWordUsed(lastSubmittedWord)
                         addLogEntry(string.format("✅ Word '%s' accepted via Server Notify!", lastSubmittedWord), Color3.fromRGB(46, 204, 113))
-                        -- Advance round
                         roundToken = roundToken + 1
                         pendingWord = nil
                         pendingSuffix = 0
@@ -1774,7 +1961,7 @@ if Remotes then
     end
 end
 
--- ==================== V6.0: REALISTIC KEYSTROKE TYPING & SUBMISSION (with roundToken) ====================
+-- ==================== V6.1: KEYSTROKE TYPING & SUBMISSION ====================
 
 typeAndSubmitWord = function(word, prefix, targetTextBox, token)
     if not word or word == "" then return false end
@@ -1783,7 +1970,16 @@ typeAndSubmitWord = function(word, prefix, targetTextBox, token)
         return false
     end
     
-    -- Use current roundToken if not passed
+    -- V6.1 HARD MODE IMPASSABLE GUARD: Never type or submit < 5 base letters in Hard Mode!
+    local hardMode = isHardModeActive()
+    local baseCount = getThaiBaseCharCount(word)
+    local totalCount = getThaiCharCount(word)
+    
+    if hardMode and (baseCount < 5 or totalCount < 5) then
+        addLogEntry(string.format("⛔ Refused '%s' (%d base chars): Hard Mode requires 5+ characters!", word, baseCount), Color3.fromRGB(231, 76, 60))
+        return false
+    end
+    
     token = token or roundToken
     
     -- Abort if round already changed
@@ -1796,8 +1992,7 @@ typeAndSubmitWord = function(word, prefix, targetTextBox, token)
     lastSubmittedWord = word
     pendingWord = word
     triedThisRound[word] = true
-    local wordLen = getThaiCharCount(word)
-    addLogEntry(string.format("Typing word '%s' (%d chars)...", word, wordLen), Color3.fromRGB(52, 152, 219))
+    addLogEntry(string.format("Typing word '%s' (%d base / %d total chars)...", word, baseCount, totalCount), Color3.fromRGB(52, 152, 219))
     
     -- 1. Delay before typing starts
     if Config.DelayBeforeTyping > 0 then
@@ -1837,7 +2032,6 @@ typeAndSubmitWord = function(word, prefix, targetTextBox, token)
         prefix = ""
     end
     
-    -- Track suffix length for backspace on rejection
     pendingSuffix = getThaiCharCount(suffix)
     
     if targetTextBox and targetTextBox.Parent then
@@ -1850,7 +2044,6 @@ typeAndSubmitWord = function(word, prefix, targetTextBox, token)
     
     if Config.SimulateTyping then
         for idx, ch in ipairs(suffixChars) do
-            -- V6.0: Check roundToken before every keystroke
             if token ~= roundToken then
                 isTypingOrSubmitting = false
                 addLogEntry("⏹️ Round changed mid-typing, aborted.", Color3.fromRGB(180, 185, 200))
@@ -1869,7 +2062,6 @@ typeAndSubmitWord = function(word, prefix, targetTextBox, token)
                 pcall(function() targetTextBox.Text = currentText end)
             end
             
-            -- Use game event module keystroke if available, otherwise TypingRemote
             if gameEventModule and rawget(gameEventModule, "fire") then
                 pcall(function()
                     gameEventModule.fire("tryKeystroke", ch)
@@ -1881,7 +2073,6 @@ typeAndSubmitWord = function(word, prefix, targetTextBox, token)
             task.wait(Config.DelayPerChar or 0.08)
         end
         
-        -- Final token check before submit
         if token ~= roundToken then
             isTypingOrSubmitting = false
             return false
@@ -1914,7 +2105,7 @@ typeAndSubmitWord = function(word, prefix, targetTextBox, token)
         return false
     end
     
-    -- 5. Submit word to Server (or via game event module)
+    -- 5. Submit word to Server
     if gameEventModule and rawget(gameEventModule, "fire") then
         pcall(function()
             gameEventModule.fire("tryAnswer")
@@ -1936,7 +2127,6 @@ end
 -- ==================== V6.0: EVENT-DRIVEN HOOKS (getgc) ====================
 
 task.spawn(function()
-    -- Try to discover game event module
     gameEventModule = discoverGameEventModule()
     
     if gameEventModule then
@@ -1945,7 +2135,7 @@ task.spawn(function()
         EventInfoLabel.Text = getText("EventDrivenStatus", "เชื่อมต่อแล้ว ✅")
         EventInfoLabel.TextColor3 = Color3.fromRGB(46, 204, 113)
         
-        -- Hook: updateRound (new round started, receive prompt + turn player)
+        -- Hook: updateRound
         pcall(function()
             local conn = gameEventModule.remoteConnect("updateRound", function(prompt, _, turnPlr)
                 roundToken = roundToken + 1
@@ -1954,11 +2144,16 @@ task.spawn(function()
                 pendingWord = nil
                 pendingSuffix = 0
                 
-                -- Detect if it's our turn
+                -- Re-verify table mode on each round
+                local currentTableMode = detectTableMode()
+                if currentTableMode ~= Config.DetectedMode then
+                    Config.DetectedMode = currentTableMode
+                    updateModePillButtons()
+                end
+                
                 if turnPlr == LocalPlayer then
                     ServerTurnState = "OurTurn"
                     
-                    -- Extract prompt text
                     local promptText = nil
                     if type(prompt) == "table" then
                         promptText = prompt.RequiredLetter or prompt.Prompt or prompt.Letter
@@ -1972,7 +2167,6 @@ task.spawn(function()
                         addLogEntry(string.format("🎯 [Event] Our Turn! Prompt: '%s' (Mode: %s)", CurrentPrompt, Config.DetectedMode), Color3.fromRGB(255, 215, 0))
                         refreshWordList(CurrentPrompt)
                         
-                        -- Auto-answer
                         if Config.AutoAnswer then
                             local token = roundToken
                             task.spawn(function()
@@ -1980,7 +2174,7 @@ task.spawn(function()
                                 if #matches > 0 then
                                     typeAndSubmitWord(matches[1].Word, CurrentPrompt, nil, token)
                                 else
-                                    addLogEntry(string.format("⚠️ No words for prompt '%s'", CurrentPrompt), Color3.fromRGB(230, 126, 34))
+                                    addLogEntry(string.format("⚠️ No words for prompt '%s' (%s)", CurrentPrompt, Config.DetectedMode), Color3.fromRGB(230, 126, 34))
                                 end
                             end)
                         end
@@ -1995,7 +2189,7 @@ task.spawn(function()
             table.insert(eventConnections, conn)
         end)
         
-        -- Hook: strike (word rejected)
+        -- Hook: strike
         pcall(function()
             local conn = gameEventModule.remoteConnect("strike", function(uid, _, alreadyUsed)
                 if uid ~= LocalPlayer.UserId then return end
@@ -2004,11 +2198,9 @@ task.spawn(function()
                 local w = pendingWord
                 
                 if alreadyUsed then
-                    -- Word was already used by someone
                     UsedWords[w] = true
                     addLogEntry(string.format("⛔ [Event] '%s' already used!", w), Color3.fromRGB(231, 76, 60))
                 else
-                    -- Word not in dictionary
                     blacklistRejectedWord(w)
                     addLogEntry(string.format("⛔ [Event] '%s' rejected & blacklisted!", w), Color3.fromRGB(231, 76, 60))
                 end
@@ -2023,7 +2215,6 @@ task.spawn(function()
                 
                 if not Config.AutoAnswer then return end
                 
-                -- Backspace and retry
                 local token = roundToken
                 local backspaces = pendingSuffix or 0
                 
@@ -2046,7 +2237,7 @@ task.spawn(function()
             table.insert(eventConnections, conn)
         end)
         
-        -- Hook: correct (word accepted)
+        -- Hook: correct
         pcall(function()
             local conn = gameEventModule.remoteConnect("correct", function(word)
                 if pendingWord then
@@ -2066,7 +2257,7 @@ task.spawn(function()
             table.insert(eventConnections, conn)
         end)
         
-        -- Hook: takeDamage (time ran out or penalty)
+        -- Hook: takeDamage
         pcall(function()
             local conn = gameEventModule.remoteConnect("takeDamage", function(uid)
                 if uid == LocalPlayer.UserId then
@@ -2086,7 +2277,6 @@ task.spawn(function()
         EventInfoLabel.TextColor3 = Color3.fromRGB(230, 126, 34)
     end
     
-    -- Also check for InGame attribute changes
     pcall(function()
         LocalPlayer:GetAttributeChangedSignal("InGame"):Connect(function()
             if LocalPlayer:GetAttribute("InGame") then
@@ -2107,19 +2297,21 @@ task.spawn(function()
     while ScreenGui and ScreenGui.Parent do
         task.wait(0.15)
         
-        -- 1. Table Mode Detection
+        -- 1. Table Mode Detection with Sticky Latch
         local currentTableMode = detectTableMode()
         if currentTableMode ~= lastKnownMode then
             lastKnownMode = currentTableMode
             Config.DetectedMode = currentTableMode
+            updateModePillButtons()
+            
             if currentTableMode == "Hard" then
-                ModeBadgeBtn.Text = getText("ModeHard")
-                ModeBadgeBtn.TextColor3 = Color3.fromRGB(231, 76, 60)
-                addLogEntry("Switched to [Hard Mode] - Min 5 characters.", Color3.fromRGB(231, 76, 60))
+                addLogEntry("Switched to [Hard Mode] - Min 5 Base Characters.", Color3.fromRGB(231, 76, 60))
             else
-                ModeBadgeBtn.Text = getText("ModeEasy")
-                ModeBadgeBtn.TextColor3 = Color3.fromRGB(46, 204, 113)
                 addLogEntry("Switched to [Easy Mode] - Any length allowed.", Color3.fromRGB(46, 204, 113))
+            end
+            
+            if CurrentPrompt and CurrentPrompt ~= "" then
+                refreshWordList(CurrentPrompt)
             end
         end
         
@@ -2141,12 +2333,10 @@ task.spawn(function()
             TurnBadge.Text = getText("TurnOurs")
             TurnBadge.TextColor3 = Color3.fromRGB(46, 204, 113)
             
-            -- Only do polling-based auto-answer if NOT using event-driven mode
             if not useEventDriven then
                 local prompt = extractCurrentPrompt(activeBox)
                 if prompt and prompt ~= "" then
                     if prompt ~= CurrentPrompt then
-                        -- New prompt detected! Advance round token
                         roundToken = roundToken + 1
                         triedThisRound = {}
                         retriesThisTurn = 0
@@ -2156,18 +2346,14 @@ task.spawn(function()
                         refreshWordList(prompt)
                     end
                     
-                    -- Auto-Answer Execution (polling fallback)
                     if Config.AutoAnswer and not isTypingOrSubmitting then
-                        if retriesThisTurn >= Config.MaxRetriesPerTurn then
-                            -- Already hit max retries, don't try more
-                        else
+                        if retriesThisTurn < Config.MaxRetriesPerTurn then
                             local matches = findMatchingWords(CurrentPrompt)
                             if #matches > 0 then
                                 local candidate = matches[1].Word
                                 local token = roundToken
                                 local submitted = typeAndSubmitWord(candidate, CurrentPrompt, activeBox, token)
                                 if submitted then
-                                    -- Wait up to 1.2s to check if word passes or fails
                                     local roundPassed = false
                                     local checkStart = tick()
                                     
@@ -2192,7 +2378,6 @@ task.spawn(function()
                                         triedThisRound = {}
                                         retriesThisTurn = 0
                                         
-                                        -- Safe transition wait
                                         local waitLimit = tick() + 2.5
                                         while tick() < waitLimit do
                                             local s, _ = getGameTurnState()
@@ -2200,7 +2385,6 @@ task.spawn(function()
                                             task.wait(0.2)
                                         end
                                     else
-                                        -- Word rejected via polling
                                         blacklistRejectedWord(candidate)
                                         retriesThisTurn = retriesThisTurn + 1
                                         TurnStatusText = "TurnRetrying"
@@ -2208,15 +2392,13 @@ task.spawn(function()
                                         TurnBadge.TextColor3 = Color3.fromRGB(231, 76, 60)
                                         addLogEntry(string.format("❌ Word '%s' rejected! (Retry %d/%d)", candidate, retriesThisTurn, Config.MaxRetriesPerTurn), Color3.fromRGB(231, 76, 60))
                                         
-                                        -- V6.0: Auto-backspace before retry
                                         sendBackspaces(pendingSuffix, token)
-                                        
                                         refreshWordList(CurrentPrompt)
                                         task.wait(0.2)
                                     end
                                 end
                             else
-                                addLogEntry(string.format("⚠️ No available words left for prompt '%s'", CurrentPrompt), Color3.fromRGB(230, 126, 34))
+                                addLogEntry(string.format("⚠️ No available words left for prompt '%s' (%s)", CurrentPrompt, Config.DetectedMode), Color3.fromRGB(230, 126, 34))
                                 task.wait(1.0)
                             end
                         end
@@ -2225,9 +2407,8 @@ task.spawn(function()
             end
         end
         
-        -- Update settings info labels periodically
         DbInfoLabel.Text = getText("DictStatus", WordCount)
     end
 end)
 
-print("[ThaiWordChain] Helper v6.0 (Event-Driven + roundToken + Auto-Backspace) Loaded!")
+print("[ThaiWordChain] Helper v6.1 (Strict 5+ Base Chars in Hard Mode + Sticky Latch) Loaded!")
