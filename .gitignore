@@ -1,0 +1,11 @@
+# Logs and dumps
+*.log
+*.txt
+word_chain_log_*.txt
+word_chain_ui_dump.txt
+
+# OS / Editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.tmp
